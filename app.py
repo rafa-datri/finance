@@ -131,6 +131,7 @@ with tab_dash:
         SELECT m.fecha,
                strftime('%Y-%m', m.fecha) AS mes,
                m.concepto,
+               m.descripcion,
                c.clasificacion,
                m.monto
         FROM movimientos m
@@ -216,6 +217,23 @@ with tab_dash:
                        legend_title=None, margin=dict(t=10))
     st.plotly_chart(figl, use_container_width=True)
 
+    # --- (D) Movimientos del mes/categorías seleccionados (drill-down) -
+    # dmes ya viene filtrado por el mes elegido y por las categorías del
+    # multiselect de arriba, así que es exactamente "los casos seleccionados".
+    st.divider()
+    etiqueta = mes_sel + (f" · {', '.join(sel)}" if sel else "")
+    st.markdown(f"**Movimientos · {etiqueta}**")
+    tabla = dmes.sort_values(["fecha", "monto"], ascending=[True, False])
+    st.caption(f"{len(tabla)} movimientos · total {fmt(tabla['monto'].sum())}")
+    st.dataframe(
+        tabla[["fecha", "concepto", "descripcion", "monto"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "concepto": st.column_config.TextColumn("categoría"),
+            "monto": st.column_config.NumberColumn("monto", format="$ %d"),
+        },
+    )
+
 
 # ======================================================================
 # TAB 3 — Detalle filtrable + búsqueda
@@ -265,4 +283,14 @@ with tab_detalle:
             "concepto": st.column_config.TextColumn("categoría"),
             "monto": st.column_config.NumberColumn("monto", format="$ %d"),
         },
+    )
+
+    # Exportar a CSV lo que se está viendo (respeta los filtros activos).
+    # utf-8-sig para que Excel abra bien los acentos (Descripción, Verdulería...).
+    csv = view[["fecha", "concepto", "clasificacion", "descripcion", "monto"]].to_csv(index=False)
+    st.download_button(
+        "⬇️ Descargar CSV",
+        data=csv.encode("utf-8-sig"),
+        file_name="movimientos.csv",
+        mime="text/csv",
     )
