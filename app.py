@@ -1,3 +1,25 @@
+"""
+App de finanzas personales — Streamlit + Turso (libSQL).
+
+Correr local:   streamlit run app.py
+Deploy:         Streamlit Community Cloud (ver README.md)
+
+Notas de arquitectura (lo distinto vs. un script Python normal):
+
+  * Streamlit RE-EJECUTA este archivo entero de arriba a abajo en cada
+    interacción (cada click, cada tecla). Por eso la conexión a la base
+    se cachea con @st.cache_resource: se crea UNA vez y se reutiliza en
+    todas las re-ejecuciones, en vez de abrir una conexión nueva por click.
+
+  * NO cacheo las lecturas (los SELECT). Con ~1000 filas la query es
+    instantánea, y así el dashboard siempre refleja el último INSERT sin
+    tener que invalidar caches. Si algún día crece mucho, ahí sí conviene
+    @st.cache_data con TTL.
+
+  * Los secretos (URL, token, password) viven en st.secrets, NO en el
+    código. Local: archivo .streamlit/secrets.toml. En la nube: se pegan
+    en la UI de Streamlit Cloud. Nunca se commitean.
+"""
 import datetime as dt
 
 import pandas as pd
@@ -144,51 +166,41 @@ with tab_dash:
     k3.metric("Neto (ahorro)", fmt(neto))
 
     st.divider()
-    izq, der = st.columns(2)
 
-    # --- (A) Balance ingreso/egreso por mes ---------------------------
-    with izq:
-        st.markdown("**Balance ingreso/egreso por mes**")
-        bal = (
-            df.groupby(["mes", "clasificacion"])["monto"].sum().reset_index()
-        )
-        fig = px.bar(
-            bal, x="mes", y="monto", color="clasificacion", barmode="group",
-            color_discrete_map={"Ingreso": COLOR_ING, "Egreso": COLOR_EGR},
-        )
-        fig.update_layout(showlegend=True, xaxis_title=None, yaxis_title=None,
-                          legend_title=None, height=320, margin=dict(t=10))
-        st.plotly_chart(fig, use_container_width=True)
+    # ================= PRINCIPAL: categorías (montos) | tabla =========
+    # Izquierda: monto por categoría del mes, incluyendo ingresos y egresos
+    # (color según clasificación: verde ingreso, rojo egreso). Clickeable.
+    # Derecha: tabla de los movimientos que componen la selección, que se
+    # filtra al clickear una barra.
+    main_l, main_r = st.columns([3, 2])
 
-    # --- (B) Egresos por categoría (montos) del mes seleccionado ------
-    # Barras: la altura es el monto de egreso por categoría (no porcentajes).
-    # Clickeable: al seleccionar una barra, la tabla de abajo muestra los
-    # movimientos que suman ese total.
-    with der:
-        st.markdown(f"**Egresos por categoría · {mes_sel}**")
-        eg = (
-            dmes[dmes.clasificacion == "Egreso"]
-            .groupby("concepto")["monto"].sum().reset_index()
+    cat_click = None
+    with main_l:
+        st.markdown(f"**Movimientos por categoría · {mes_sel}**")
+        g = (
+            dmes.groupby("concepto")
+            .agg(monto=("monto", "sum"), clasif=("clasificacion", "first"))
+            .reset_index()
             .sort_values("monto", ascending=False)
         )
-        cat_click = None
-        if eg.empty:
-            st.caption("Sin egresos este mes.")
+        if g.empty:
+            st.caption("Sin movimientos este mes.")
         else:
-            figb = px.bar(eg, x="concepto", y="monto")
+            colores = [COLOR_ING if c == "Ingreso" else COLOR_EGR for c in g["clasif"]]
+            figb = px.bar(g, x="concepto", y="monto")
             figb.update_traces(
-                marker_color=COLOR_EGR,
+                marker_color=colores,
                 texttemplate="%{y:.2s}", textposition="outside",
                 hovertemplate="%{x}<br>$ %{y:,.0f}<extra></extra>",
             )
-            figb.update_layout(height=320, xaxis_title=None, yaxis_title=None,
+            figb.update_layout(height=420, xaxis_title=None, yaxis_title=None,
                                margin=dict(t=10), showlegend=False)
             # key atado al mes/categorías -> la selección se resetea al
             # cambiar de filtro y no queda "pegada" una barra vieja.
             ev = st.plotly_chart(
                 figb, use_container_width=True,
                 on_select="rerun", selection_mode="points",
-                key=f"egr_bar_{mes_sel}_{'-'.join(sel)}",
+                key=f"cat_bar_{mes_sel}_{'-'.join(sel)}",
             )
             try:
                 pts = ev["selection"]["points"]
@@ -197,48 +209,60 @@ with tab_dash:
             if pts:
                 cat_click = pts[0].get("x")
 
-    # --- (C) Evolución / tendencia del neto mensual -------------------
-    st.markdown("**Evolución del neto mensual (ahorro)**")
-    piv = (
-        df.pivot_table(index="mes", columns="clasificacion", values="monto",
-                       aggfunc="sum", fill_value=0)
-        .reset_index()
-    )
-    piv["neto"] = piv.get("Ingreso", 0) - piv.get("Egreso", 0)
-    piv["media_movil_3"] = piv["neto"].rolling(3, min_periods=1).mean()
+    with main_r:
+        if cat_click:
+            st.markdown(f"**Movimientos · {cat_click}**")
+            tabla = dmes[dmes.concepto == cat_click]
+        else:
+            st.markdown(f"**Movimientos · {mes_sel}**")
+            tabla = dmes
+        tabla = tabla.sort_values(["fecha", "monto"], ascending=[True, False])
+        aviso = "" if cat_click else "  ·  clickeá una barra para desglosarla"
+        st.caption(f"{len(tabla)} mov · total {fmt(tabla['monto'].sum())}{aviso}")
+        st.dataframe(
+            tabla[["fecha", "concepto", "descripcion", "monto"]],
+            use_container_width=True, hide_index=True, height=380,
+            column_config={
+                "concepto": st.column_config.TextColumn("categoría"),
+                "monto": st.column_config.NumberColumn("monto", format="$ %d"),
+            },
+        )
 
-    figl = go.Figure()
-    figl.add_bar(x=piv["mes"], y=piv["neto"], name="Neto",
-                 marker_color=[COLOR_ING if v >= 0 else COLOR_EGR for v in piv["neto"]])
-    figl.add_scatter(x=piv["mes"], y=piv["media_movil_3"], name="Media móvil 3m",
-                     mode="lines+markers", line=dict(color="#34495E", width=2))
-    figl.update_layout(height=340, xaxis_title=None, yaxis_title=None,
-                       legend_title=None, margin=dict(t=10))
-    st.plotly_chart(figl, use_container_width=True)
-
-    # --- (D) Movimientos que componen la selección (drill-down) --------
-    # Si clickeaste una barra de egresos, muestra los movimientos que suman
-    # ese total. Si no, muestra todos los del mes (y categorías del filtro).
     st.divider()
-    if cat_click:
-        titulo = f"Movimientos · {mes_sel} · {cat_click}"
-        tabla = dmes[dmes.concepto == cat_click]
-    else:
-        etiqueta = mes_sel + (f" · {', '.join(sel)}" if sel else "")
-        titulo = f"Movimientos · {etiqueta}"
-        tabla = dmes
-    st.markdown(f"**{titulo}**")
-    tabla = tabla.sort_values(["fecha", "monto"], ascending=[True, False])
-    aviso = "" if cat_click else "  ·  tip: clickeá una barra de egresos para desglosarla"
-    st.caption(f"{len(tabla)} movimientos · total {fmt(tabla['monto'].sum())}{aviso}")
-    st.dataframe(
-        tabla[["fecha", "concepto", "descripcion", "monto"]],
-        use_container_width=True, hide_index=True,
-        column_config={
-            "concepto": st.column_config.TextColumn("categoría"),
-            "monto": st.column_config.NumberColumn("monto", format="$ %d"),
-        },
-    )
+
+    # ================= ABAJO: los otros dos gráficos, lado a lado ======
+    bot_l, bot_r = st.columns(2)
+
+    # Balance ingreso/egreso por mes (todos los meses)
+    with bot_l:
+        st.markdown("**Balance ingreso/egreso por mes**")
+        bal = df.groupby(["mes", "clasificacion"])["monto"].sum().reset_index()
+        fig = px.bar(
+            bal, x="mes", y="monto", color="clasificacion", barmode="group",
+            color_discrete_map={"Ingreso": COLOR_ING, "Egreso": COLOR_EGR},
+        )
+        fig.update_layout(showlegend=True, xaxis_title=None, yaxis_title=None,
+                          legend_title=None, height=320, margin=dict(t=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Evolución del neto mensual (ahorro)
+    with bot_r:
+        st.markdown("**Evolución del neto mensual (ahorro)**")
+        piv = (
+            df.pivot_table(index="mes", columns="clasificacion", values="monto",
+                           aggfunc="sum", fill_value=0)
+            .reset_index()
+        )
+        piv["neto"] = piv.get("Ingreso", 0) - piv.get("Egreso", 0)
+        piv["media_movil_3"] = piv["neto"].rolling(3, min_periods=1).mean()
+        figl = go.Figure()
+        figl.add_bar(x=piv["mes"], y=piv["neto"], name="Neto",
+                     marker_color=[COLOR_ING if v >= 0 else COLOR_EGR for v in piv["neto"]])
+        figl.add_scatter(x=piv["mes"], y=piv["media_movil_3"], name="Media móvil 3m",
+                         mode="lines+markers", line=dict(color="#34495E", width=2))
+        figl.update_layout(height=320, xaxis_title=None, yaxis_title=None,
+                           legend_title=None, margin=dict(t=10))
+        st.plotly_chart(figl, use_container_width=True)
 
 
 # ======================================================================
