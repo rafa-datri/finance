@@ -1,25 +1,3 @@
-"""
-App de finanzas personales — Streamlit + Turso (libSQL).
-
-Correr local:   streamlit run app.py
-Deploy:         Streamlit Community Cloud (ver README.md)
-
-Notas de arquitectura (lo distinto vs. un script Python normal):
-
-  * Streamlit RE-EJECUTA este archivo entero de arriba a abajo en cada
-    interacción (cada click, cada tecla). Por eso la conexión a la base
-    se cachea con @st.cache_resource: se crea UNA vez y se reutiliza en
-    todas las re-ejecuciones, en vez de abrir una conexión nueva por click.
-
-  * NO cacheo las lecturas (los SELECT). Con ~1000 filas la query es
-    instantánea, y así el dashboard siempre refleja el último INSERT sin
-    tener que invalidar caches. Si algún día crece mucho, ahí sí conviene
-    @st.cache_data con TTL.
-
-  * Los secretos (URL, token, password) viven en st.secrets, NO en el
-    código. Local: archivo .streamlit/secrets.toml. En la nube: se pegan
-    en la UI de Streamlit Cloud. Nunca se commitean.
-"""
 import datetime as dt
 
 import pandas as pd
@@ -182,21 +160,42 @@ with tab_dash:
                           legend_title=None, height=320, margin=dict(t=10))
         st.plotly_chart(fig, use_container_width=True)
 
-    # --- (B) Egresos por concepto (del mes seleccionado) --------------
+    # --- (B) Egresos por categoría (montos) del mes seleccionado ------
+    # Barras: la altura es el monto de egreso por categoría (no porcentajes).
+    # Clickeable: al seleccionar una barra, la tabla de abajo muestra los
+    # movimientos que suman ese total.
     with der:
-        st.markdown(f"**Egresos por concepto · {mes_sel}**")
+        st.markdown(f"**Egresos por categoría · {mes_sel}**")
         eg = (
             dmes[dmes.clasificacion == "Egreso"]
             .groupby("concepto")["monto"].sum().reset_index()
             .sort_values("monto", ascending=False)
         )
+        cat_click = None
         if eg.empty:
             st.caption("Sin egresos este mes.")
         else:
-            figp = px.pie(eg, values="monto", names="concepto", hole=0.45)
-            figp.update_traces(textposition="inside", textinfo="percent+label")
-            figp.update_layout(showlegend=False, height=320, margin=dict(t=10))
-            st.plotly_chart(figp, use_container_width=True)
+            figb = px.bar(eg, x="concepto", y="monto")
+            figb.update_traces(
+                marker_color=COLOR_EGR,
+                texttemplate="%{y:.2s}", textposition="outside",
+                hovertemplate="%{x}<br>$ %{y:,.0f}<extra></extra>",
+            )
+            figb.update_layout(height=320, xaxis_title=None, yaxis_title=None,
+                               margin=dict(t=10), showlegend=False)
+            # key atado al mes/categorías -> la selección se resetea al
+            # cambiar de filtro y no queda "pegada" una barra vieja.
+            ev = st.plotly_chart(
+                figb, use_container_width=True,
+                on_select="rerun", selection_mode="points",
+                key=f"egr_bar_{mes_sel}_{'-'.join(sel)}",
+            )
+            try:
+                pts = ev["selection"]["points"]
+            except (KeyError, TypeError):
+                pts = []
+            if pts:
+                cat_click = pts[0].get("x")
 
     # --- (C) Evolución / tendencia del neto mensual -------------------
     st.markdown("**Evolución del neto mensual (ahorro)**")
@@ -217,14 +216,21 @@ with tab_dash:
                        legend_title=None, margin=dict(t=10))
     st.plotly_chart(figl, use_container_width=True)
 
-    # --- (D) Movimientos del mes/categorías seleccionados (drill-down) -
-    # dmes ya viene filtrado por el mes elegido y por las categorías del
-    # multiselect de arriba, así que es exactamente "los casos seleccionados".
+    # --- (D) Movimientos que componen la selección (drill-down) --------
+    # Si clickeaste una barra de egresos, muestra los movimientos que suman
+    # ese total. Si no, muestra todos los del mes (y categorías del filtro).
     st.divider()
-    etiqueta = mes_sel + (f" · {', '.join(sel)}" if sel else "")
-    st.markdown(f"**Movimientos · {etiqueta}**")
-    tabla = dmes.sort_values(["fecha", "monto"], ascending=[True, False])
-    st.caption(f"{len(tabla)} movimientos · total {fmt(tabla['monto'].sum())}")
+    if cat_click:
+        titulo = f"Movimientos · {mes_sel} · {cat_click}"
+        tabla = dmes[dmes.concepto == cat_click]
+    else:
+        etiqueta = mes_sel + (f" · {', '.join(sel)}" if sel else "")
+        titulo = f"Movimientos · {etiqueta}"
+        tabla = dmes
+    st.markdown(f"**{titulo}**")
+    tabla = tabla.sort_values(["fecha", "monto"], ascending=[True, False])
+    aviso = "" if cat_click else "  ·  tip: clickeá una barra de egresos para desglosarla"
+    st.caption(f"{len(tabla)} movimientos · total {fmt(tabla['monto'].sum())}{aviso}")
     st.dataframe(
         tabla[["fecha", "concepto", "descripcion", "monto"]],
         use_container_width=True, hide_index=True,
